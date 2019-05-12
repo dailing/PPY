@@ -28,6 +28,15 @@ class SharedClass(ABC):
         for name, sp in self._shared_property.items():
             sp._del(self, name)
 
+    def _class_name(self):
+        klass = self.__class__
+        return f'{klass.__module__}.{klass.__qualname__}'
+
+
+class ParallelMethod:
+    def __init__(self):
+        pass
+
 
 class SharedProperty:
     def __init__(self):
@@ -65,8 +74,8 @@ class SharedProperty:
         else:
             self._redis = redis.Redis(connection_pool=redis_pool)
         self.attr_name = attr_name
-        self.value_key = f'__{self.attr_name}_redis_key__.value'
-        self.reference_count_key = f'__{self.attr_name}_redis_key__.ref_count'
+        self.value_key = f'__{self.attr_name}_redis_key__value'
+        self.reference_count_key = f'__{self.attr_name}_redis_key__ref_count'
         setattr(
             instance,
             self.value_key,
@@ -99,6 +108,79 @@ class SharedProperty:
         if refc == 0:
             logger.info(f'destroy instance {self.attr_name}')
             self._redis.delete(ref, val)
+
+
+class SharedDict(SharedProperty):
+    class SharedDictOperator:
+        def __init__(self, _redis: redis.Redis, dict_key):
+            self._redis = _redis
+            self.dict_key = dict_key
+
+        def __getitem__(self, key):
+            key = SharedDict._value_encoder(key)
+            result = self._redis.hget(self.dict_key, key)
+            if result is None:
+                raise KeyError(SharedDict._value_decoder(key))
+            return SharedDict._value_decoder(result)
+
+        def __setitem__(self, key, value):
+            key = SharedDict._value_encoder(key)
+            self._redis.hset(
+                self.dict_key,
+                key,
+                SharedDict._value_encoder(value))
+
+    def __init__(self):
+        super().__init__()
+
+    @SharedProperty._handle_init_get
+    def __get__(self, instance: SharedClass, owner):
+        return SharedDict.SharedDictOperator(
+            self._redis,
+            getattr(instance, self.value_key))
+
+    def __set__(self, instance, value):
+        raise Exception("Fuck, Don\'t fuck ME!")
+
+
+class SharedQueue(SharedProperty):
+    class SharedQueueOperator:
+        def __init__(self, _redis: redis.Redis, dict_key):
+            self._redis = _redis
+            self.dict_key = dict_key
+
+        def pop(self):
+            result = self._redis.lpop(self.dict_key)
+            if result is None:
+                raise IndexError('pop from empty list')
+            return SharedDict._value_decoder(result)
+
+        def bpop(self):
+            result = self._redis.blpop(self.dict_key)[1]
+            if result is None:
+                raise IndexError('pop from empty list')
+            return SharedDict._value_decoder(result)
+
+        def push(self, *values):
+            values = list(map(
+                lambda x: SharedQueue._value_encoder(x),
+                values))
+            self._redis.rpush(self.dict_key, *values)
+
+    def __init__(self):
+        super().__init__()
+
+    @SharedProperty._handle_init_get
+    def __get__(self, instance: SharedClass, owner):
+        return SharedQueue.SharedQueueOperator(
+            self._redis,
+            getattr(instance, self.value_key))
+
+    def __set__(self, instance, value):
+        raise Exception("Fuck, Don\'t fuck ME!")
+
+    def pop(self):
+        pass
 
 
 class RemoteEnv:
