@@ -13,17 +13,35 @@ class SharedClass(ABC):
         if instance_id is None:
             instance_id = uuid.uuid4().__str__()
         self._instance_id = instance_id
-        if redis_pool is None:
-            self._redis = redis.Redis(host='localhost', port=6379, db=0)
-        else:
-            self._redis = redis.Redis(connection_pool=redis_pool)
+        self._shared_property = {}
         logger.info('init')
         for i in self.__dir__():
             ti = type(self.__getattribute__(i))
             if issubclass(ti, SharedProperty):
                 logger.info(f'initiate SharedProperty: {i}')
                 sp = self.__getattribute__(i)
-                sp._init(self, i)
+                sp._init(self, i, redis_pool)
+                self._shared_property[i] = sp
+
+    def __del__(self):
+        logger.info('destroy class')
+        for name, sp in self._shared_property.items():
+            sp._del(self, name)
+
+
+class SharedProperty:
+    def __init__(self):
+        self.attr_name = None
+        self.value_key = None
+        self.reference_count_key = None
+
+    def _handle_init_get(func):
+        def wrapper(self, instance, owner):
+            if self.value_key is None or not hasattr(instance, self.value_key):
+                return self
+            return func(self, instance, owner)
+
+        return wrapper
 
     @staticmethod
     def _value_encoder(val):
@@ -41,42 +59,46 @@ class SharedClass(ABC):
         value = self._redis.get(name)
         return self._value_decoder(value)
 
-
-class SharedProperty:
-    def __init__(self):
-        self.attr_name = None
-        self.redis_key = None
-
-    def _handle_init_get(func):
-        def wrapper(self, instance, owner):
-            if self.redis_key is None or not hasattr(instance, self.redis_key):
-                return self
-            return func(self, instance, owner)
-
-        return wrapper
-
-    def _init(self, instance: SharedClass, attr_name):
+    def _init(self, instance: SharedClass, attr_name, redis_pool=None):
+        if redis_pool is None:
+            self._redis = redis.Redis(host='localhost', port=6379, db=0)
+        else:
+            self._redis = redis.Redis(connection_pool=redis_pool)
         self.attr_name = attr_name
-        self.redis_key = f'__{self.attr_name}_redis_key__'
+        self.value_key = f'__{self.attr_name}_redis_key__.value'
+        self.reference_count_key = f'__{self.attr_name}_redis_key__.ref_count'
         setattr(
             instance,
-            self.redis_key,
-            f'{instance._instance_id}.{attr_name}')
+            self.value_key,
+            f'{instance._instance_id}.{attr_name}.value')
+        setattr(
+            instance,
+            self.reference_count_key,
+            f'{instance._instance_id}.{attr_name}.reference_count'
+        )
+        self._redis.incr(getattr(instance, self.reference_count_key), 1)
 
     @_handle_init_get
     def __get__(self, instance: SharedClass, owner):
         logger.info(f'get property:{self.attr_name}')
-        return instance._get_sync_val_(
-            getattr(instance, self.redis_key))
+        return self._get_sync_val_(
+            getattr(instance, self.value_key))
 
     def __set__(self, instance, value):
         logger.info(f'set property {self.attr_name} to: {value}')
-        instance._set_sync_val_(
-            getattr(instance, self.redis_key),
+        self._set_sync_val_(
+            getattr(instance, self.value_key),
             value)
 
-    def __del__(self):
-        pass
+    def _del(self, instance: SharedClass, attr_name):
+        if self.reference_count_key is None:
+            return
+        ref = getattr(instance, self.reference_count_key)
+        val = getattr(instance, self.value_key)
+        refc = self._redis.decr(ref, 1)
+        if refc == 0:
+            logger.info(f'destroy instance {self.attr_name}')
+            self._redis.delete(ref, val)
 
 
 class RemoteEnv:
